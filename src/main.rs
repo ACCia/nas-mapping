@@ -11,6 +11,45 @@ fn entry_url(server: &str) -> String {
     format!("https://{server}:{PORT}/webapi/entry.cgi")
 }
 
+async fn logout(client: &reqwest::Client, server: &str, sid: &str) {
+    let _ = client
+        .get(entry_url(server))
+        .query(&[
+            ("api", "SYNO.API.Auth"),
+            ("version", "6"),
+            ("method", "logout"),
+            ("session", "FileStation"),
+            ("_sid", sid),
+        ])
+        .send()
+        .await;
+}
+
+/// 获取 NAS 主机名（普通用户权限即可），失败返回 None
+async fn get_hostname(client: &reqwest::Client, sid: &str, server: &str) -> Option<String> {
+    let resp: Value = client
+        .get(entry_url(server))
+        .query(&[
+            ("api", "SYNO.FileStation.Info"),
+            ("version", "2"),
+            ("method", "get"),
+            ("_sid", sid),
+        ])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    if !resp["success"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    resp["data"]["hostname"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// SYNO.API.Auth 常见错误码的中文说明
 fn auth_error_msg(code: i64) -> String {
     let meaning = match code {
@@ -95,6 +134,27 @@ async fn list_shares(
         .collect())
 }
 
+/// 从 DSM 首页 <meta name="application-name" content="..."> 提取站点名称
+fn parse_app_name(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let pos = lower.find("application-name")?;
+    let rest = &html[pos + "application-name".len()..];
+    let cpos = rest.to_lowercase().find("content=")?;
+    let rest = &rest[cpos + "content=".len()..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &rest[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    let name = rest[..end].trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// 探测单台主机是否为群晖 DSM
 async fn probe_dsm(
     client: reqwest::Client,
@@ -112,29 +172,53 @@ async fn probe_dsm(
     }
 }
 
-/// 扫描网段，返回开放了 DSM Web API（5001 端口）的主机列表
-async fn scan_nas(client: &reqwest::Client) -> Vec<String> {
+/// 免登录获取站点名称（DSM 首页 meta 标签）
+async fn fetch_app_name(client: &reqwest::Client, ip: &str) -> Option<String> {
+    let html = client
+        .get(format!("https://{ip}:{PORT}/"))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    parse_app_name(&html)
+}
+
+/// 扫描网段，返回开放了 DSM Web API（5001 端口）的主机及其站点名称
+async fn scan_nas(client: &reqwest::Client) -> Vec<(String, Option<String>)> {
     let mut set = tokio::task::JoinSet::new();
     for i in 1u8..=254 {
         let ip = format!("{SUBNET}.{i}");
         let client = client.clone();
         set.spawn(async move {
-            let probe = probe_dsm(client, ip);
-            match tokio::time::timeout(Duration::from_millis(1500), probe).await {
-                Ok(Ok(ip)) => Some(ip),
-                _ => None,
+            // API 探测和名称获取分别限时，名称失败不影响主机入列
+            let probe = probe_dsm(client.clone(), ip.clone());
+            if tokio::time::timeout(Duration::from_millis(1500), probe)
+                .await
+                .ok()
+                .is_none()
+            {
+                return None;
             }
+            let name = match tokio::time::timeout(Duration::from_millis(2500), fetch_app_name(&client, &ip)).await {
+                Ok(name) => name,
+                Err(_) => None,
+            };
+            Some((ip, name))
         });
     }
 
     let mut found = Vec::new();
     while let Some(res) = set.join_next().await {
-        if let Ok(Some(ip)) = res {
-            found.push(ip);
+        if let Ok(Some(pair)) = res {
+            found.push(pair);
         }
     }
     // 按 IP 末段排序
-    found.sort_by_key(|ip| ip.rsplit('.').next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0));
+    found.sort_by_key(|(ip, _)| {
+        ip.rsplit('.').next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0)
+    });
     found
 }
 
@@ -205,9 +289,9 @@ mod platform {
     }
 
     /// 通过"网络快捷方式"目录创建网络位置（此电脑 > 网络位置）
-    fn map_network_location(server: &str, share: &str) -> Result<(), String> {
-        // 显示名称带服务器前缀，如 "10.15.0.2-home"
-        let display_name = format!("{server}-{share}");
+    fn map_network_location(nas_name: &str, server: &str, share: &str) -> Result<(), String> {
+        // 显示名称带 NAS 名称前缀，如 "reeji-wf-home"
+        let display_name = format!("{nas_name}-{share}");
         let appdata = std::env::var("APPDATA").map_err(|_| "未找到 APPDATA 环境变量".to_string())?;
         let place_dir = Path::new(&appdata)
             .join("Microsoft")
@@ -250,6 +334,7 @@ mod platform {
 
     pub fn perform_mapping(
         server: &str,
+        nas_name: &str,
         shares: &[&str],
         account: &str,
         passwd: &str,
@@ -274,9 +359,9 @@ mod platform {
                     }
                 }
                 2 => {
-                    print!("\n正在创建网络位置 {server}-{share} ... ");
+                    print!("\n正在创建网络位置 {nas_name}-{share} ... ");
                     io::stdout().flush().ok();
-                    match map_network_location(server, share) {
+                    match map_network_location(nas_name, server, share) {
                         Ok(()) => println!("成功！已添加到\"此电脑 > 网络位置\"（如未显示请刷新窗口）。"),
                         Err(e) => println!("失败：{e}"),
                     }
@@ -310,12 +395,13 @@ mod platform {
 
     pub fn perform_mapping(
         server: &str,
+        nas_name: &str,
         shares: &[&str],
         account: &str,
         passwd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         for share in shares {
-            println!("\n正在挂载 {share} ...");
+            println!("\n正在挂载 {nas_name}/{share} ...");
             // 共享名用原始 UTF-8（AppleScript/NetFS 原生支持中文），仅 userinfo 编码
             let url = format!(
                 "smb://{}:{}@{}/{}",
@@ -350,7 +436,7 @@ mod platform {
                 println!("osascript 未能挂载共享（仅连接了服务器），尝试回退方案...");
             }
             let home = std::env::var("HOME").map_err(|_| "未找到 HOME 环境变量".to_string())?;
-            let mp = Path::new(&home).join("Volumes").join(share);
+            let mp = Path::new(&home).join("Volumes").join(format!("{nas_name}-{share}"));
             std::fs::create_dir_all(&mp).map_err(|e| format!("创建挂载点失败: {e}"))?;
             let direct = format!(
                 "smb://{}:{}@{}/{}",
@@ -476,25 +562,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\n可用的群晖 DSM 服务：");
-    for (idx, server) in servers.iter().enumerate() {
-        println!("  {:>2}. https://{}:{}", idx + 1, server, PORT);
+    let labels: Vec<String> = servers
+        .iter()
+        .map(|(ip, name)| match name {
+            Some(n) => format!("{ip}（{n}）"),
+            None => format!("{ip}"),
+        })
+        .collect();
+    for (idx, label) in labels.iter().enumerate() {
+        println!("  {:>2}. {}", idx + 1, label);
     }
 
     let server = if servers.len() == 1 {
-        println!("\n仅发现一台，自动选择 {}", servers[0]);
-        servers[0].clone()
+        println!("\n仅发现一台，自动选择 {}", servers[0].0);
+        servers[0].0.clone()
     } else {
-        let Some(choice) = prompt_choice(&servers, "连接") else {
+        let Some(choice) = prompt_choice(&labels, "连接") else {
             println!("已退出。");
             return Ok(());
         };
-        servers[choice].clone()
+        servers[choice].0.clone()
     };
 
     let sid = login(&client, &server, &account, &passwd).await?;
     let shares = list_shares(&client, &sid, &server).await?;
+    // 站点名（扫描时获取）优先，其次主机名，最后 IP
+    let scanned_name = servers
+        .iter()
+        .find(|(ip, _)| *ip == server)
+        .and_then(|(_, n)| n.clone());
+    let nas_name = match scanned_name {
+        Some(n) => n,
+        None => get_hostname(&client, &sid, &server)
+            .await
+            .unwrap_or_else(|| server.clone()),
+    };
 
-    println!("\n服务器 {} 上当前用户（{account}）可访问的共享（共 {} 个）：", server, shares.len());
+    println!(
+        "\n服务器 {}（{nas_name}）上当前用户（{account}）可访问的共享（共 {} 个）：",
+        server,
+        shares.len()
+    );
     for (idx, share) in shares.iter().enumerate() {
         println!("  {:>2}. {}", idx + 1, share);
     }
@@ -516,22 +624,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let selected: Vec<&str> = selection.iter().map(|&i| shares[i].as_str()).collect();
 
-        if let Err(e) = platform::perform_mapping(&server, &selected, &account, &passwd) {
+        if let Err(e) = platform::perform_mapping(&server, &nas_name, &selected, &account, &passwd) {
             println!("出错：{e}");
         }
     }
 
     // 登出 DSM 会话
-    let _ = client
-        .get(entry_url(&server))
-        .query(&[
-            ("api", "SYNO.API.Auth"),
-            ("version", "6"),
-            ("method", "logout"),
-            ("session", "FileStation"),
-            ("_sid", sid.as_str()),
-        ])
-        .send()
-        .await;
+    logout(&client, &server, &sid).await;
     Ok(())
 }
