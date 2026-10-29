@@ -316,12 +316,13 @@ mod platform {
     ) -> Result<(), Box<dyn std::error::Error>> {
         for share in shares {
             println!("\n正在挂载 {share} ...");
+            // 共享名用原始 UTF-8（AppleScript/NetFS 原生支持中文），仅 userinfo 编码
             let url = format!(
                 "smb://{}:{}@{}/{}",
                 url_encode(account),
                 url_encode(passwd),
                 server,
-                url_encode(share)
+                share
             );
             let script = format!("mount volume \"{url}\"");
             let output = Command::new("osascript")
@@ -329,20 +330,35 @@ mod platform {
                 .output()
                 .map_err(|e| format!("执行 osascript 失败: {e}"))?;
 
-            if output.status.success() {
-                println!("成功！{share} 已挂载（Finder 侧边栏\"位置\"中可见）。");
+            // osascript 成功不代表共享真的挂上了，用 mount 输出确认挂载点
+            let mounted = find_mount_point(server, share);
+            if output.status.success() && mounted.is_some() {
+                println!(
+                    "成功！已挂载到 {}（Finder 侧边栏\"位置\"中可见）。",
+                    mounted.unwrap()
+                );
                 continue;
             }
 
             // 回退：无 GUI 会话等场景下用 mount_smbfs 挂到 ~/Volumes/{share}
-            println!(
-                "osascript 挂载失败（{}），尝试回退方案...",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            if !output.status.success() {
+                println!(
+                    "osascript 挂载失败（{}），尝试回退方案...",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            } else {
+                println!("osascript 未能挂载共享（仅连接了服务器），尝试回退方案...");
+            }
             let home = std::env::var("HOME").map_err(|_| "未找到 HOME 环境变量".to_string())?;
             let mp = Path::new(&home).join("Volumes").join(share);
             std::fs::create_dir_all(&mp).map_err(|e| format!("创建挂载点失败: {e}"))?;
-            let direct = format!("smb://{}:{}@{}/{}", url_encode(account), url_encode(passwd), server, url_encode(share));
+            let direct = format!(
+                "smb://{}:{}@{}/{}",
+                url_encode(account),
+                url_encode(passwd),
+                server,
+                share
+            );
             let output = Command::new("mount_smbfs")
                 .args([&direct, &mp.to_string_lossy().into_owned()])
                 .output()
@@ -356,6 +372,23 @@ mod platform {
             }
         }
         Ok(())
+    }
+
+    /// 在 mount 输出里查找 //server@/share 形式的挂载点
+    fn find_mount_point(server: &str, share: &str) -> Option<String> {
+        let output = Command::new("mount").output().ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        // smbfs 挂载行形如: //user@server/share on /Volumes/share (smbfs, ...)
+        for line in text.lines() {
+            if line.contains("smbfs") && line.contains(server) && line.contains(share) {
+                if let Some(pos) = line.find(" on ") {
+                    let rest = &line[pos + 4..];
+                    let mp = rest.split(" (").next().unwrap_or(rest);
+                    return Some(mp.to_string());
+                }
+            }
+        }
+        None
     }
 }
 
