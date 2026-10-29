@@ -11,6 +11,21 @@ fn entry_url(server: &str) -> String {
     format!("https://{server}:{PORT}/webapi/entry.cgi")
 }
 
+/// SYNO.API.Auth 常见错误码的中文说明
+fn auth_error_msg(code: i64) -> String {
+    let meaning = match code {
+        400 => "账号不存在或密码错误",
+        401 => "账号已被停用",
+        402 => "没有登录权限",
+        403 => "需要两步验证",
+        404 => "两步验证码错误",
+        406 => "尝试次数过多，账号被临时锁定",
+        407 => "密码已过期，需在 DSM 网页修改",
+        _ => "未知错误",
+    };
+    format!("DSM 错误码 {code}：{meaning}")
+}
+
 async fn login(
     client: &reqwest::Client,
     server: &str,
@@ -35,8 +50,8 @@ async fn login(
 
     if !resp["success"].as_bool().unwrap_or(false) {
         return Err(format!(
-            "登录失败: DSM 错误码 {}",
-            resp["error"]["code"].as_i64().unwrap_or(-1)
+            "登录失败: {}",
+            auth_error_msg(resp["error"]["code"].as_i64().unwrap_or(-1))
         )
         .into());
     }
