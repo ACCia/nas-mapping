@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches: [master, main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -45,3 +49,10 @@ jobs:
         with:
           name: untitled-${{ matrix.target }}
           path: untitled-${{ matrix.target }}${{ matrix.ext }}
+
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: untitled-${{ matrix.target }}${{ matrix.ext }}
+          generate_release_notes: true
