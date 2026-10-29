@@ -288,11 +288,25 @@ mod platform {
     }
 }
 
-// ==================== macOS：mount_smbfs 挂载到 /Volumes ====================
+// ==================== macOS：osascript 挂载（走系统 NetFS 通道） ====================
 #[cfg(target_os = "macos")]
 mod platform {
     use std::path::Path;
     use std::process::Command;
+
+    /// RFC 3986 percent-encoding（用于 smb URL 的 userinfo 和路径）
+    fn url_encode(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
 
     pub fn perform_mapping(
         server: &str,
@@ -300,31 +314,44 @@ mod platform {
         account: &str,
         passwd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // 挂载点：优先 /Volumes/{share}，被占用时退避为 /Volumes/{server}-{share}
-        let volumes = Path::new("/Volumes");
         for share in shares {
-            let base = volumes.join(share);
-            let mount_point = if base.exists() {
-                volumes.join(format!("{server}-{share}"))
-            } else {
-                base
-            };
-            std::fs::create_dir_all(&mount_point).map_err(|e| format!("创建挂载点失败: {e}"))?;
+            println!("\n正在挂载 {share} ...");
+            let url = format!(
+                "smb://{}:{}@{}/{}",
+                url_encode(account),
+                url_encode(passwd),
+                server,
+                url_encode(share)
+            );
+            let script = format!("mount volume \"{url}\"");
+            let output = Command::new("osascript")
+                .args(["-e", &script])
+                .output()
+                .map_err(|e| format!("执行 osascript 失败: {e}"))?;
 
-            let url = format!("smb://{account}:{passwd}@{server}/{share}");
-            let mp_str = mount_point.to_string_lossy().into_owned();
+            if output.status.success() {
+                println!("成功！{share} 已挂载（Finder 侧边栏\"位置\"中可见）。");
+                continue;
+            }
 
-            println!("\n正在挂载 {share} -> {mp_str} ...");
+            // 回退：无 GUI 会话等场景下用 mount_smbfs 挂到 ~/Volumes/{share}
+            println!(
+                "osascript 挂载失败（{}），尝试回退方案...",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            let home = std::env::var("HOME").map_err(|_| "未找到 HOME 环境变量".to_string())?;
+            let mp = Path::new(&home).join("Volumes").join(share);
+            std::fs::create_dir_all(&mp).map_err(|e| format!("创建挂载点失败: {e}"))?;
+            let direct = format!("smb://{}:{}@{}/{}", url_encode(account), url_encode(passwd), server, url_encode(share));
             let output = Command::new("mount_smbfs")
-                .args([&url, &mp_str])
+                .args([&direct, &mp.to_string_lossy().into_owned()])
                 .output()
                 .map_err(|e| format!("执行 mount_smbfs 失败: {e}"))?;
 
             if output.status.success() {
-                println!("成功！已挂载到 {mp_str}（Finder 侧边栏\"位置\"中可见）。");
+                println!("成功！已挂载到 {}", mp.display());
             } else {
-                // 挂载失败时清理空挂载点，继续处理其余共享
-                let _ = std::fs::remove_dir(&mount_point);
+                let _ = std::fs::remove_dir(&mp);
                 println!("失败：{}", String::from_utf8_lossy(&output.stderr).trim());
             }
         }
